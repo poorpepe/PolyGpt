@@ -1,0 +1,546 @@
+name: bootstrap
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Create folders + starter files
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p bot state web/app web/app/api/state web/app/api/config web/app/api/run-now web/app/config web/app/wallets .github/workflows
+
+          cat > .gitignore <<'EOF'
+          **/.env
+          **/.venv
+          **/__pycache__/
+          node_modules/
+          .next/
+          dist/
+          .DS_Store
+          EOF
+
+          cat > README.md <<'EOF'
+          # Polymarket Paper Bot + Next.js Dashboard (GitHub Actions + Vercel)
+
+          Test-only system:
+          - GitHub Actions runs a paper trader every ~5 minutes and writes `state/paper_state.json`
+          - Next.js 16+ dashboard reads state and edits `state/config.json` via GitHub API
+
+          Steps:
+          1) Create branch `paper-state` from `main`
+          2) Settings → Actions → Workflow permissions → Read & write
+          3) Actions → run `papertrade`
+          EOF
+
+          cat > state/config.json <<'EOF'
+          {
+            "virtual_usdc_start": 1000,
+            "max_usdc_per_trade": 25,
+            "max_spread": 0.05,
+            "tick": 0.01,
+            "edge_ticks": 1,
+            "order_ttl_secs": 3600,
+            "cooldown_secs": 60,
+            "allow_short": false,
+            "wallets": []
+          }
+          EOF
+
+          cat > state/paper_state.json <<'EOF'
+          {
+            "updated_at": 0,
+            "virtual_usdc": 1000.0,
+            "positions": {},
+            "open_orders": [],
+            "fills": [],
+            "signals": [],
+            "last_seen_ts": {},
+            "cooldowns": {},
+            "logs": []
+          }
+          EOF
+
+          cat > bot/requirements.txt <<'EOF'
+          py-clob-client
+          requests
+          EOF
+
+          cat > bot/papertrade.py <<'EOF'
+          import json, os, time
+          import requests
+          from py_clob_client.client import ClobClient
+
+          CONFIG_PATH = os.getenv("CONFIG_PATH", "state/config.json")
+          STATE_PATH  = os.getenv("STATE_PATH",  "state/paper_state.json")
+          DATA_API_BASE = os.getenv("DATA_API_BASE", "https://data-api.polymarket.com")
+          CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
+
+          def load_json(path, default):
+            if os.path.exists(path):
+              with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+            return default
+
+          def save_json(path, obj):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+              json.dump(obj, f, indent=2, sort_keys=True)
+
+          def now(): return int(time.time())
+
+          def log(state, msg):
+            state["logs"] = (state.get("logs", []) + [f"{now()}: {msg}"])[-200:]
+
+          def fetch_activity(wallet, start_ts):
+            params = {"user": wallet, "type": "TRADE", "start": int(start_ts), "sortDirection": "ASC", "limit": 200, "offset": 0}
+            r = requests.get(f"{DATA_API_BASE}/activity", params=params, timeout=25)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+              return data["data"]
+            return data if isinstance(data, list) else []
+
+          def best_bid_ask(clob, token_id):
+            book = clob.get_order_book(token_id)
+            bid = float(book.bids[0].price) if book.bids else None
+            ask = float(book.asks[0].price) if book.asks else None
+            return bid, ask
+
+          def maker_price(side, bid, ask, tick, edge_ticks):
+            edge = tick * edge_ticks
+            if side == "BUY":
+              return max(0.01, min(0.99, min(ask - tick, bid + edge)))
+            return max(0.01, min(0.99, max(bid + tick, ask - edge)))
+
+          def create_order(token_id, side, px, usdc_size, src):
+            ts = now()
+            return {"id": f"paper-{ts}-{token_id}-{side}", "token_id": token_id, "side": side, "price": float(px),
+                    "usdc_size": float(usdc_size), "created_at": ts, "src": src}
+
+          def apply_fills(cfg, state, clob):
+            ttl = int(cfg.get("order_ttl_secs", 3600))
+            allow_short = bool(cfg.get("allow_short", False))
+            n = now()
+            still = []
+            for o in state.get("open_orders", []):
+              if n - int(o.get("created_at", n)) > ttl:
+                log(state, f"Expired {o.get('id')}")
+                continue
+              bid, ask = best_bid_ask(clob, o["token_id"])
+              if bid is None or ask is None or ask <= bid:
+                still.append(o); continue
+              side = o["side"]; limit_px = float(o["price"]); usdc = float(o["usdc_size"])
+              if side == "BUY" and ask <= limit_px:
+                px = ask; shares = usdc / px
+                if float(state.get("virtual_usdc", 0.0)) < usdc:
+                  still.append(o); continue
+                state["virtual_usdc"] = float(state["virtual_usdc"]) - usdc
+                state["positions"][o["token_id"]] = float(state["positions"].get(o["token_id"], 0.0)) + shares
+                state["fills"].append({"ts": n, "order_id": o["id"], "side":"BUY","token_id":o["token_id"],"px":px,"usdc":usdc,"shares":shares})
+                log(state, f"FILLED BUY {o['token_id']} px={px:.4f} usdc={usdc:.2f}")
+                continue
+              if side == "SELL" and bid >= limit_px:
+                px = bid; shares = usdc / px
+                pos = float(state["positions"].get(o["token_id"], 0.0))
+                if not allow_short and pos <= 0:
+                  still.append(o); continue
+                if not allow_short:
+                  max_usdc = pos * px
+                  if max_usdc <= 0:
+                    still.append(o); continue
+                  usdc = min(usdc, max_usdc); shares = usdc / px
+                state["virtual_usdc"] = float(state["virtual_usdc"]) + usdc
+                state["positions"][o["token_id"]] = float(state["positions"].get(o["token_id"], 0.0)) - shares
+                state["fills"].append({"ts": n, "order_id": o["id"], "side":"SELL","token_id":o["token_id"],"px":px,"usdc":usdc,"shares":shares})
+                log(state, f"FILLED SELL {o['token_id']} px={px:.4f} usdc={usdc:.2f}")
+                continue
+              still.append(o)
+            state["open_orders"] = still
+
+          def main():
+            cfg = load_json(CONFIG_PATH, {})
+            state = load_json(STATE_PATH, {})
+            state.setdefault("positions", {})
+            state.setdefault("open_orders", [])
+            state.setdefault("fills", [])
+            state.setdefault("signals", [])
+            state.setdefault("last_seen_ts", {})
+            state.setdefault("cooldowns", {})
+            state.setdefault("logs", [])
+            state.setdefault("virtual_usdc", float(cfg.get("virtual_usdc_start", 1000)))
+
+            clob = ClobClient(CLOB_HOST)
+
+            apply_fills(cfg, state, clob)
+
+            wallets = cfg.get("wallets", [])
+            tick = float(cfg.get("tick", 0.01))
+            edge_ticks = int(cfg.get("edge_ticks", 1))
+            max_spread = float(cfg.get("max_spread", 0.05))
+            max_usdc = float(cfg.get("max_usdc_per_trade", 25))
+            cooldown = int(cfg.get("cooldown_secs", 60))
+            n = now()
+
+            for w in wallets:
+              if not w.get("enabled", True): continue
+              wallet = w.get("address","").strip().lower()
+              if not wallet: continue
+              weight = max(1, int(w.get("weight", 1)))
+              last_ts = int(state["last_seen_ts"].get(wallet, 0))
+              try:
+                events = fetch_activity(wallet, last_ts)
+              except Exception as e:
+                log(state, f"ERROR activity {wallet} {repr(e)}")
+                continue
+
+              for e in events:
+                ts = int(e.get("timestamp") or 0)
+                if ts <= last_ts: continue
+                side = e.get("side"); token_id = e.get("asset"); usdc = float(e.get("usdcSize") or 0.0)
+                sig = {"ts": ts, "wallet": wallet, "side": side, "token_id": token_id, "usdc_size": usdc}
+                decision = {"status":"skipped","reason":""}
+
+                if side not in ("BUY","SELL") or not token_id or usdc <= 0:
+                  decision["reason"]="missing_fields"; sig["decision"]=decision; state["signals"].append(sig); last_ts=max(last_ts,ts); continue
+
+                if n - int(state["cooldowns"].get(wallet, 0)) < cooldown:
+                  decision["reason"]="cooldown"; sig["decision"]=decision; state["signals"].append(sig); last_ts=max(last_ts,ts); continue
+
+                usdc = min(usdc * weight, max_usdc)
+                bid, ask = best_bid_ask(clob, token_id)
+                if bid is None or ask is None or ask <= bid:
+                  decision["reason"]="no_liquidity"; sig["decision"]=decision; state["signals"].append(sig); last_ts=max(last_ts,ts); continue
+
+                spread = ask - bid
+                if spread > max_spread:
+                  decision["reason"]="spread_too_wide"; sig["decision"]=decision; state["signals"].append(sig); last_ts=max(last_ts,ts); continue
+
+                if side == "BUY" and float(state.get("virtual_usdc", 0.0)) < usdc:
+                  decision["reason"]="insufficient_virtual_usdc"; sig["decision"]=decision; state["signals"].append(sig); last_ts=max(last_ts,ts); continue
+
+                px = maker_price(side, bid, ask, tick, edge_ticks)
+                order = create_order(token_id, side, px, usdc, {"wallet": wallet, "signal_ts": ts})
+                state["open_orders"].append(order)
+                state["cooldowns"][wallet]=n
+                decision={"status":"queued","reason":"","order_id":order["id"],"limit_px":px}
+                sig["decision"]=decision
+                state["signals"].append(sig)
+                log(state, f"NEW ORDER {wallet} {side} {token_id} px={px:.4f} usdc={usdc:.2f}")
+                last_ts = max(last_ts, ts)
+
+              state["last_seen_ts"][wallet] = last_ts
+
+            state["signals"] = state["signals"][-500:]
+            state["updated_at"] = n
+            save_json(STATE_PATH, state)
+            print(json.dumps({"ok": True, "updated_at": n}, indent=2))
+
+          if __name__ == "__main__":
+            main()
+          EOF
+
+          cat > .github/workflows/papertrade.yml <<'EOF'
+          name: papertrade
+
+          on:
+            schedule:
+              - cron: "*/5 * * * *"
+            workflow_dispatch: {}
+
+          permissions:
+            contents: write
+
+          jobs:
+            run-papertrade:
+              runs-on: ubuntu-latest
+              steps:
+                - name: Checkout paper-state branch
+                  uses: actions/checkout@v4
+                  with:
+                    ref: paper-state
+
+                - name: Set up Python
+                  uses: actions/setup-python@v5
+                  with:
+                    python-version: "3.11"
+
+                - name: Install dependencies
+                  run: |
+                    python -m pip install --upgrade pip
+                    pip install -r bot/requirements.txt
+
+                - name: Run papertrade
+                  env:
+                    CONFIG_PATH: state/config.json
+                    STATE_PATH: state/paper_state.json
+                    DATA_API_BASE: https://data-api.polymarket.com
+                    CLOB_HOST: https://clob.polymarket.com
+                  run: |
+                    python bot/papertrade.py
+
+                - name: Commit updated state
+                  run: |
+                    git config user.name "papertrade-bot"
+                    git config user.email "papertrade-bot@users.noreply.github.com"
+                    git add state/paper_state.json
+                    git commit -m "Update paper state" || echo "No changes"
+                    git push
+          EOF
+
+          # Next.js 16+ app skeleton (minimal)
+          cat > web/package.json <<'EOF'
+          {
+            "name": "polymarket-paperbot-dashboard",
+            "private": true,
+            "version": "0.1.0",
+            "scripts": {
+              "dev": "next dev",
+              "build": "next build",
+              "start": "next start",
+              "lint": "next lint"
+            },
+            "dependencies": {
+              "next": "^16.1.0",
+              "react": "^19.2.0",
+              "react-dom": "^19.2.0"
+            },
+            "devDependencies": {
+              "typescript": "^5.5.4",
+              "@types/node": "^20.14.10",
+              "@types/react": "^19.0.0",
+              "@types/react-dom": "^19.0.0",
+              "eslint": "^9.0.0",
+              "eslint-config-next": "^16.1.0"
+            },
+            "engines": { "node": ">=20" }
+          }
+          EOF
+
+          cat > web/next.config.js <<'EOF'
+          /** @type {import('next').NextConfig} */
+          const nextConfig = { reactStrictMode: true };
+          module.exports = nextConfig;
+          EOF
+
+          cat > web/next-env.d.ts <<'EOF'
+          /// <reference types="next" />
+          /// <reference types="next/image-types/global" />
+          EOF
+
+          cat > web/tsconfig.json <<'EOF'
+          {
+            "compilerOptions": {
+              "target": "ES2022",
+              "lib": ["dom", "dom.iterable", "es2022"],
+              "allowJs": false,
+              "skipLibCheck": true,
+              "strict": true,
+              "noEmit": true,
+              "esModuleInterop": true,
+              "module": "esnext",
+              "moduleResolution": "bundler",
+              "resolveJsonModule": true,
+              "isolatedModules": true,
+              "jsx": "preserve",
+              "incremental": true,
+              "types": ["node"]
+            },
+            "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+            "exclude": ["node_modules"]
+          }
+          EOF
+
+          cat > web/app/layout.tsx <<'EOF'
+          import type { Metadata } from "next";
+
+          export const metadata: Metadata = {
+            title: "Paperbot Dashboard",
+            description: "Polymarket paper trading bot dashboard",
+          };
+
+          export default function RootLayout({ children }: { children: React.ReactNode }) {
+            return (
+              <html lang="en">
+                <body style={{ margin: 0, fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial" }}>
+                  <div style={{ borderBottom: "1px solid #eee", padding: "12px 16px", display: "flex", gap: 12 }}>
+                    <a href="/" style={{ textDecoration: "none" }}>Dashboard</a>
+                    <a href="/config" style={{ textDecoration: "none" }}>Config</a>
+                    <a href="/wallets" style={{ textDecoration: "none" }}>Wallets</a>
+                  </div>
+                  <div style={{ padding: 16 }}>{children}</div>
+                </body>
+              </html>
+            );
+          }
+          EOF
+
+          cat > web/app/api/state/route.ts <<'EOF'
+          export const runtime = "nodejs";
+
+          export async function GET() {
+            const owner = process.env.GH_OWNER!;
+            const repo = process.env.GH_REPO!;
+            const branch = process.env.GH_BRANCH || "paper-state";
+            const path = process.env.GH_STATE_PATH || "state/paper_state.json";
+
+            const url = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`;
+            const r = await fetch(url, { cache: "no-store" });
+
+            return new Response(await r.text(), {
+              status: r.status,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          EOF
+
+          cat > web/app/api/config/route.ts <<'EOF'
+          export const runtime = "nodejs";
+
+          function ghHeaders() {
+            const token = process.env.GH_TOKEN!;
+            return {
+              Authorization: `Bearer ${token}`,
+              "X-GitHub-Api-Version": "2022-11-28",
+              Accept: "application/vnd.github+json",
+            };
+          }
+
+          async function getConfigShaAndContent(owner: string, repo: string, path: string, branch: string) {
+            const url = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`;
+            const r = await fetch(url, { headers: ghHeaders(), cache: "no-store" });
+            if (!r.ok) {
+              const t = await r.text();
+              throw new Error(`GitHub GET contents failed: ${r.status} ${t}`);
+            }
+            const j: any = await r.json();
+            const contentB64 = (j.content || "").replace(/\\n/g, "");
+            const content = Buffer.from(contentB64, "base64").toString("utf8");
+            return { sha: j.sha as string, content };
+          }
+
+          export async function GET() {
+            const owner = process.env.GH_OWNER!;
+            const repo = process.env.GH_REPO!;
+            const branch = process.env.GH_BRANCH || "paper-state";
+            const path = process.env.GH_CONFIG_PATH || "state/config.json";
+
+            const { content } = await getConfigShaAndContent(owner, repo, path, branch);
+            return new Response(content, { headers: { "content-type": "application/json" } });
+          }
+
+          export async function PUT(req: Request) {
+            const owner = process.env.GH_OWNER!;
+            const repo = process.env.GH_REPO!;
+            const branch = process.env.GH_BRANCH || "paper-state";
+            const path = process.env.GH_CONFIG_PATH || "state/config.json";
+
+            const body = await req.json();
+
+            const { sha } = await getConfigShaAndContent(owner, repo, path, branch);
+            const newContent = JSON.stringify(body, null, 2);
+            const contentB64 = Buffer.from(newContent, "utf8").toString("base64");
+
+            const putUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`;
+            const r = await fetch(putUrl, {
+              method: "PUT",
+              headers: { ...ghHeaders(), "Content-Type": "application/json" },
+              body: JSON.stringify({
+                message: "Update paperbot config (UI)",
+                content: contentB64,
+                sha,
+                branch,
+              }),
+            });
+
+            const text = await r.text();
+            return new Response(text, { status: r.status, headers: { "content-type": "application/json" } });
+          }
+          EOF
+
+          cat > web/app/page.tsx <<'EOF'
+          "use client";
+          import { useEffect, useState } from "react";
+
+          function fmt(ts?: number) {
+            if (!ts) return "-";
+            return new Date(ts * 1000).toLocaleString();
+          }
+
+          export default function Page() {
+            const [state, setState] = useState<any>(null);
+
+            async function refresh() {
+              const r = await fetch("/api/state", { cache: "no-store" });
+              setState(await r.json());
+            }
+
+            useEffect(() => {
+              refresh();
+              const t = setInterval(refresh, 2000);
+              return () => clearInterval(t);
+            }, []);
+
+            const openOrders = state?.open_orders ?? [];
+            const fills = state?.fills ?? [];
+
+            return (
+              <main>
+                <h1 style={{ marginTop: 0 }}>Paperbot Dashboard</h1>
+
+                <div style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "12px 0" }}>
+                  <Card title="Virtual USDC" value={state?.virtual_usdc?.toFixed?.(2) ?? "-"} />
+                  <Card title="Open Orders" value={String(openOrders.length)} />
+                  <Card title="Total Fills" value={String(fills.length)} />
+                  <Card title="Updated" value={fmt(state?.updated_at)} />
+                </div>
+
+                <pre style={{ background: "#111", color: "#0f0", padding: 12, borderRadius: 10, overflowX: "auto" }}>
+                  {JSON.stringify(state, null, 2)}
+                </pre>
+              </main>
+            );
+          }
+
+          function Card({ title, value }: { title: string; value: string }) {
+            return (
+              <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, minWidth: 190 }}>
+                <div style={{ fontSize: 12, opacity: 0.65 }}>{title}</div>
+                <div style={{ fontSize: 22, fontWeight: 800 }}>{value}</div>
+              </div>
+            );
+          }
+          EOF
+
+          # placeholder pages so routes exist
+          cat > web/app/config/page.tsx <<'EOF'
+          export default function ConfigPage() {
+            return <main><h1>Config</h1><p>Use the full zip version for the complete UI.</p></main>;
+          }
+          EOF
+
+          cat > web/app/wallets/page.tsx <<'EOF'
+          export default function WalletsPage() {
+            return <main><h1>Wallets</h1><p>Use the full zip version for the complete UI.</p></main>;
+          }
+          EOF
+
+      - name: Commit changes
+        run: |
+          set -euxo pipefail
+          git status
+          git add -A
+          git commit -m "Bootstrap paperbot repo structure" || echo "No changes to commit"
+          git push
